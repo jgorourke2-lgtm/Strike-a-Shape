@@ -2246,7 +2246,7 @@ const SB_VERSION = "2.45.4";
 class SupabaseNet {
   constructor(cfg) { this.kind = "supabase"; this.cfg = cfg; this.offset = 0; this.subs = new Map(); this.dcHandlers = new Map(); }
   async init() {
-    if (!window.supabase) await loadScript(`https://cdn.jsdelivr.net/npm/@supabase/supabase-js@${SB_VERSION}/dist/umd/supabase.js`);
+    if (!window.supabase) { try { await loadScript("vendor/supabase.js"); } catch (e) { await loadScript(`https://cdn.jsdelivr.net/npm/@supabase/supabase-js@${SB_VERSION}/dist/umd/supabase.js`); } }
     this.sb = window.supabase.createClient(this.cfg.url, this.cfg.anonKey);
     // Estimate how far this laptop's clock is from the server's, so countdowns line up.
     const t0 = Date.now();
