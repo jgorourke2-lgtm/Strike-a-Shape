@@ -326,6 +326,7 @@ td.num, th.num { text-align: right; }
         <p>Touch the green dot with your index fingertip to start drawing.</p>
         <p>Follow the faded outline. Covered parts turn green.</p>
         <p>Drop your hand out of view to lift the pen.</p>
+        <p>Aim assist pulls your pen onto the line when you're close.</p>
       </div>
     </aside>
   </main>
@@ -479,7 +480,15 @@ const CONFIG = {
     // Streak: each round in a row graded A or better raises the multiplier.
     STREAK_MULTS: [1, 1.25, 1.5, 2],
     // Round points before multipliers run 100-1000. Grade thresholds:
-    GRADES: [["S", 850], ["A", 720], ["B", 560], ["C", 400], ["D", 0]],
+    GRADES: [["S", 880], ["A", 760], ["B", 600], ["C", 440], ["D", 0]],
+    ACCURACY_ZERO_PX: 32, // average distance from the line (px) that scores 0% accuracy. Lower = stricter.
+
+    // Aim assist (hand tracking only): helps a shaky tracker stay on the line.
+    AIM_ASSIST: true,
+    ASSIST_RADIUS: 55,       // within this many px of the outline, the pen is pulled toward it
+    ASSIST_STRENGTH: 0.75,   // 0-1: how hard it pulls when you're right next to the line
+    ASSIST_TWIST_SCALE: 0.5, // weaker pull in Memory / Connect the dots rounds so it doesn't reveal the shape
+    STABILIZER_PX: 5,        // the pen ignores fingertip wobble smaller than this
 
     // Hand tracking stability (press D during Finger Trace to see raw vs. smoothed tracking)
     LIGHT_CORRECTION: true,  // auto-fix dim / overexposed camera images before tracking
@@ -972,7 +981,7 @@ class OneEuro {
   }
 }
 
-const hand = { fx: null, fy: null, last: null, lastSeen: 0, pending: null, raw: null, smooth: null, state: "lost" };
+const hand = { fx: null, fy: null, last: null, lastSeen: 0, pending: null, raw: null, smooth: null, lazy: null, aimFrom: null, state: "lost" };
 function resetHandFilters() {
   hand.fx = new OneEuro(CONFIG.TRACE.SMOOTH_MIN_CUTOFF, CONFIG.TRACE.SMOOTH_BETA);
   hand.fy = new OneEuro(CONFIG.TRACE.SMOOTH_MIN_CUTOFF, CONFIG.TRACE.SMOOTH_BETA);
@@ -1026,10 +1035,54 @@ function updateTip() {
     return;
   }
   const age = performance.now() - hand.lastSeen;
-  if (hand.smooth && age < 120) { hand.state = "tracking"; penTip = hand.smooth; }
-  else if (hand.smooth && age <= CONFIG.TRACE.GRACE_MS) { hand.state = "searching"; penTip = hand.smooth; } // brief drop-out: keep the pen down
-  else { hand.state = "lost"; penTip = null; }
+  if (hand.smooth && age < 120) { hand.state = "tracking"; penTip = stabilize(hand.smooth); }
+  else if (hand.smooth && age <= CONFIG.TRACE.GRACE_MS) { hand.state = "searching"; penTip = hand.lazy || hand.smooth; } // brief drop-out: keep the pen down
+  else { hand.state = "lost"; penTip = null; hand.lazy = null; }
   rawTip = hand.state === "lost" ? null : hand.raw;
+  hand.aimFrom = penTip;
+  penTip = aimAssist(penTip);
+}
+
+/* ---------- Aim assist ---------- */
+// Stabilizer ("lazy brush"): the pen trails the fingertip on a short string, so wobble
+// smaller than STABILIZER_PX doesn't move it at all, and bigger moves pass straight through.
+function stabilize(p) {
+  const R = CONFIG.TRACE.STABILIZER_PX;
+  if (!hand.lazy || !R) { hand.lazy = { x: p.x, y: p.y }; return hand.lazy; }
+  const d = dist(p, hand.lazy);
+  if (d > R) {
+    const k = (d - R) / d;
+    hand.lazy = { x: hand.lazy.x + (p.x - hand.lazy.x) * k, y: hand.lazy.y + (p.y - hand.lazy.y) * k };
+  }
+  return hand.lazy;
+}
+// Closest point on the outline (projected onto its segments, not just the checkpoints).
+function nearestOnOutline(t, p) {
+  const S = t.samples, n = S.length, segs = t.closed ? n : n - 1;
+  let best = null, bd = Infinity;
+  for (let i = 0; i < segs; i++) {
+    const a = S[i], b = S[(i + 1) % n];
+    const vx = b.x - a.x, vy = b.y - a.y, L = vx * vx + vy * vy || 1;
+    const u = clamp(((p.x - a.x) * vx + (p.y - a.y) * vy) / L, 0, 1);
+    const qx = a.x + vx * u, qy = a.y + vy * u, d = (p.x - qx) ** 2 + (p.y - qy) ** 2;
+    if (d < bd) { bd = d; best = { x: qx, y: qy }; }
+  }
+  return { q: best, d: Math.sqrt(bd) };
+}
+// Magnet: near the outline, pull the pen toward it. The pull fades to zero at ASSIST_RADIUS,
+// so going way off the line still counts against you. Before the trace starts, it pulls toward the start dot.
+function aimAssist(p) {
+  const T = CONFIG.TRACE;
+  if (!p || !T.AIM_ASSIST || traceInput !== "hand" || G.state !== "playing" || !G.r || !G.r.trace || !G.r.trace.samples) return p;
+  const t = G.r.trace;
+  let q, d;
+  if (!t.started) { q = t.samples[0]; d = dist(p, q); }
+  else ({ q, d } = nearestOnOutline(t, p));
+  const R = T.ASSIST_RADIUS;
+  if (d >= R || d < 0.01) return p;
+  const strength = T.ASSIST_STRENGTH * (G.r.mod ? T.ASSIST_TWIST_SCALE : 1);
+  const pull = strength * (1 - d / R);
+  return { x: p.x + (q.x - p.x) * pull, y: p.y + (q.y - p.y) * pull };
 }
 
 /* ---------- Drawing ---------- */
@@ -1183,6 +1236,13 @@ function drawTrace(dt) {
 
   // Fingertip cursor. While drawing, its ring shows how close you are to the line.
   const cur = traceInput === "mouse" ? mouse.pos : penTip;
+  // Aim assist at work: a faint dot where the finger really is, tied to the pen
+  if (cur && hand.aimFrom && traceInput === "hand" && dist(hand.aimFrom, cur) > 3) {
+    ctx.beginPath(); ctx.moveTo(hand.aimFrom.x, hand.aimFrom.y); ctx.lineTo(cur.x, cur.y);
+    ctx.lineWidth = 2; ctx.strokeStyle = "rgba(255, 255, 255, 0.35)"; ctx.stroke();
+    ctx.beginPath(); ctx.arc(hand.aimFrom.x, hand.aimFrom.y, 4, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(255, 255, 255, 0.45)"; ctx.fill();
+  }
   if (cur) {
     let ring = "#FFFFFF";
     if (G.state === "playing" && r && r.trace && r.trace.started && penTip) ring = devColor(nearestDist(r.trace, penTip));
@@ -1278,7 +1338,7 @@ function nearestDist(t, p) {
 // Adds one pen point. Returns its distance from the outline.
 function addTracePoint(t, from, to) {
   const d = nearestDist(t, to);
-  t.devSum += Math.min(d, CONFIG.TRACE.TOLERANCE * 3);
+  t.devSum += Math.min(d, CONFIG.TRACE.ACCURACY_ZERO_PX * 1.5);
   t.devN++;
   if (from) {
     const n = Math.max(1, Math.ceil(dist(from, to) / 5));
@@ -1293,7 +1353,7 @@ function addTracePoint(t, from, to) {
 }
 function traceAccuracy(t) {
   if (!t.devN) return 0;
-  return clamp(1 - t.devSum / t.devN / (CONFIG.TRACE.TOLERANCE * 2), 0, 1);
+  return clamp(1 - t.devSum / t.devN / CONFIG.TRACE.ACCURACY_ZERO_PX, 0, 1);
 }
 function traceStep(r) {
   const t = r.trace, tip = penTip;
