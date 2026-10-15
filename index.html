@@ -327,6 +327,7 @@ td.num, th.num { text-align: right; }
         <p>Follow the faded outline. Covered parts turn green.</p>
         <p>Drop your hand out of view to lift the pen.</p>
         <p>Aim assist pulls your pen onto the line when you're close.</p>
+        <p>Only your pointing index finger draws. Other hands and curled fingers are ignored.</p>
       </div>
     </aside>
   </main>
@@ -458,6 +459,9 @@ const CONFIG = {
   // FIREBASE: { apiKey: "...", authDomain: "...", databaseURL: "https://....firebaseio.com", projectId: "...", appId: "..." },
   // Leave null to test lobbies between tabs in one browser.
   FIREBASE: null,
+  // Ranked lobbies on Supabase (free). Paste the Project URL and anon public key from
+  // Project Settings > API, and run supabase/setup.sql once. Used first if filled in.
+  SUPABASE: { url: "https://tdxfcseahfhiepioxfte.supabase.co", anonKey: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRkeGZjc2VhaGZoaWVwaW94ZnRlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTIwMTA0NDIsImV4cCI6MjEwNzU4NjQ0Mn0.Oz_1s2I5bJ0xbZT7NogWz4yy6fABuupB_8ce-ClkJYk" },
   MAX_PLAYERS: 8,
 
   RETRIES_PER_ROUND: 1,
@@ -852,7 +856,7 @@ async function createHands() {
       delegate,
     },
     runningMode: "VIDEO",
-    numHands: 1,
+    numHands: 2, // look at up to two hands; chooseHand() picks the pointing one
     // Lower than MediaPipe's defaults (0.5) so tracking holds on in dim or harsh light.
     minHandDetectionConfidence: CONFIG.TRACE.HAND_CONFIDENCE,
     minHandPresenceConfidence: CONFIG.TRACE.HAND_CONFIDENCE,
@@ -981,7 +985,7 @@ class OneEuro {
   }
 }
 
-const hand = { fx: null, fy: null, last: null, lastSeen: 0, pending: null, raw: null, smooth: null, lazy: null, aimFrom: null, state: "lost" };
+const hand = { fx: null, fy: null, last: null, lastSeen: 0, pending: null, raw: null, smooth: null, lazy: null, aimFrom: null, label: null, state: "lost" };
 function resetHandFilters() {
   hand.fx = new OneEuro(CONFIG.TRACE.SMOOTH_MIN_CUTOFF, CONFIG.TRACE.SMOOTH_BETA);
   hand.fy = new OneEuro(CONFIG.TRACE.SMOOTH_MIN_CUTOFF, CONFIG.TRACE.SMOOTH_BETA);
@@ -1018,14 +1022,39 @@ function senseHand() {
   const now = performance.now();
   let res = null;
   try { res = handLandmarker.detectForVideo(frame, now); } catch (e) { return; }
-  const lm = res && res.landmarks && res.landmarks[0];
-  if (!lm) return;
-  const score = res.handedness && res.handedness[0] && res.handedness[0][0] ? res.handedness[0][0].score : 1;
-  if (score < CONFIG.TRACE.HAND_CONFIDENCE) return;
+  const pick = chooseHand(res, now);
+  if (!pick) return;
+  if (pick.label) hand.label = pick.label; // remember which hand (left/right) we're following
   // Blend the fingertip with the joint below it: the tip alone jitters the most.
-  const tip = lm[8], dip = lm[7];
+  const tip = pick.lm[8], dip = pick.lm[7];
   const nx = tip.x * 0.75 + dip.x * 0.25, ny = tip.y * 0.75 + dip.y * 0.25;
   acceptDetection({ x: 640 - nx * 640, y: ny * 480 }, now); // detection canvas is the unmirrored view
+}
+
+// The tracker can see more than one hand, and a curled hand or a stray finger can be picked up.
+// So a hand only counts if its index finger is pointing out. If several hands qualify, take the one
+// closest to where the pen already is, and prefer the same left/right hand as before.
+function fingerPointing(lm) {
+  const len = (i) => Math.hypot((lm[i].x - lm[0].x) * 480, (lm[i].y - lm[0].y) * 360);
+  return len(8) > len(5) * 1.4; // index fingertip far out past its knuckle = extended
+}
+function chooseHand(res, now) {
+  if (!res || !res.landmarks) return null;
+  let best = null, bestCost = Infinity;
+  res.landmarks.forEach((lm, i) => {
+    if (!fingerPointing(lm)) return;
+    const cat = res.handedness && res.handedness[i] && res.handedness[i][0];
+    const label = cat ? cat.categoryName : null;
+    let cost = 0;
+    if (hand.last && now - hand.lastSeen < 500) {
+      const tip = lm[8], dip = lm[7];
+      const p = { x: 640 - (tip.x * 0.75 + dip.x * 0.25) * 640, y: (tip.y * 0.75 + dip.y * 0.25) * 480 };
+      cost += dist(p, hand.last) * 0.5;
+    }
+    if (hand.label && label && label !== hand.label) cost += 80;
+    if (cost < bestCost) { bestCost = cost; best = { lm, label }; }
+  });
+  return best;
 }
 
 function updateTip() {
@@ -2212,9 +2241,76 @@ class FirebaseNet {
   cancelDisconnect(c, path) { this.ref(c).child(path).onDisconnect().cancel(); }
 }
 
+// Online backend: Supabase (free Postgres database with live updates). See supabase/setup.sql.
+const SB_VERSION = "2.45.4";
+class SupabaseNet {
+  constructor(cfg) { this.kind = "supabase"; this.cfg = cfg; this.offset = 0; this.subs = new Map(); this.dcHandlers = new Map(); }
+  async init() {
+    if (!window.supabase) await loadScript(`https://cdn.jsdelivr.net/npm/@supabase/supabase-js@${SB_VERSION}/dist/umd/supabase.js`);
+    this.sb = window.supabase.createClient(this.cfg.url, this.cfg.anonKey);
+    // Estimate how far this laptop's clock is from the server's, so countdowns line up.
+    const t0 = Date.now();
+    const { data, error } = await this.sb.rpc("server_time");
+    const t1 = Date.now();
+    if (error) throw error;
+    this.offset = Number(data) - (t0 + t1) / 2;
+  }
+  now() { return Date.now() + this.offset; }
+  async get(c) {
+    const { data, error } = await this.sb.from("lobbies").select("data").eq("code", c).maybeSingle();
+    if (error) throw error;
+    return data ? data.data : null;
+  }
+  async create(c, obj) {
+    const { error } = await this.sb.from("lobbies").insert({ code: c, data: obj });
+    if (error) throw error;
+  }
+  subscribe(c, cb) {
+    let live = false; // once a live update has arrived, an older initial read must not overwrite it
+    const ch = this.sb.channel("lobby-" + c)
+      .on("postgres_changes", { event: "*", schema: "public", table: "lobbies", filter: "code=eq." + c }, (p) => {
+        live = true;
+        cb(p.eventType === "DELETE" ? null : p.new.data);
+      })
+      .subscribe();
+    this.subs.set(c, ch);
+    this.get(c).then((v) => { if (!live) cb(v); }).catch(() => {});
+  }
+  unsubscribe(c) {
+    const ch = this.subs.get(c);
+    if (ch) { this.sb.removeChannel(ch); this.subs.delete(c); }
+  }
+  async patch(c, updates) {
+    const { error } = await this.sb.rpc("patch_lobby", { p_code: c, p_updates: updates });
+    if (error) throw error;
+  }
+  async remove(c) {
+    const { error } = await this.sb.from("lobbies").delete().eq("code", c);
+    if (error) throw error;
+  }
+  // Best effort: when this tab closes, remove the player. Browsers don't guarantee this
+  // (unlike Firebase), so a player who closes the tab mid-match may still hold up the host.
+  onDisconnectRemove(c, path) {
+    const h = () => {
+      fetch(`${this.cfg.url}/rest/v1/rpc/patch_lobby`, {
+        method: "POST", keepalive: true,
+        headers: { apikey: this.cfg.anonKey, Authorization: "Bearer " + this.cfg.anonKey, "Content-Type": "application/json" },
+        body: JSON.stringify({ p_code: c, p_updates: { [path]: null } }),
+      }).catch(() => {});
+    };
+    window.addEventListener("pagehide", h);
+    this.dcHandlers.set(c + path, h);
+  }
+  cancelDisconnect(c, path) {
+    const h = this.dcHandlers.get(c + path);
+    if (h) { window.removeEventListener("pagehide", h); this.dcHandlers.delete(c + path); }
+  }
+}
+
 async function getNet() {
   if (R.net) return R.net;
-  const net = CONFIG.FIREBASE ? new FirebaseNet(CONFIG.FIREBASE) : new LocalNet();
+  const net = CONFIG.SUPABASE && CONFIG.SUPABASE.url && CONFIG.SUPABASE.anonKey ? new SupabaseNet(CONFIG.SUPABASE)
+    : CONFIG.FIREBASE ? new FirebaseNet(CONFIG.FIREBASE) : new LocalNet();
   await net.init();
   R.net = net;
   return net;
