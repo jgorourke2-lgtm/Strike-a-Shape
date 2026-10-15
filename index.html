@@ -144,6 +144,10 @@ th { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: 
 td.num, th.num { text-align: right; }
 .miss { color: var(--red); font-weight: 700; }
 
+/* First visit: only the tutorial is offered */
+body.firsttime #startTrace { display: none; }
+body.firsttime #startTutorial { background: var(--blue, #3b82f6); color: #fff; }
+
 /* Ranked lobby */
 .ranked-form { display: grid; gap: 12px; min-width: 0; }
 .field { display: grid; gap: 6px; min-width: 0; }
@@ -1895,6 +1899,13 @@ function tick(dt) {
   }
 }
 
+/* ---------- First visit ---------- */
+// Remembers (per browser) whether the tutorial has been finished. Until then, only "How to play" is offered.
+const SEEN_KEY = "strikeAShape.tutorialDone";
+function tutorialDone() { try { return localStorage.getItem(SEEN_KEY) === "1"; } catch (e) { return false; } }
+function markTutorialDone() { try { localStorage.setItem(SEEN_KEY, "1"); } catch (e) {} document.body.classList.remove("firsttime"); }
+if (!tutorialDone() && !params.has("mouse") && !params.has("skiptutorial")) document.body.classList.add("firsttime");
+
 /* ---------- Starting a game ---------- */
 function resetStartButtons() {
   const t = $("#startTrace");
@@ -2085,6 +2096,7 @@ function renderCoach() {
   const add = (label, cls, fn) => { const b = document.createElement("button"); b.type = "button"; b.className = "btn " + cls; b.textContent = label; b.addEventListener("click", fn); bw.appendChild(b); };
   if (step.next) add(step.next, "primary", () => tutStep(T.step + 1));
   if (step.final) {
+    markTutorialDone();
     add("Play solo", "primary", () => { G.tutorial = null; G.warmedUp = true; newGame(); });
     add("Main menu", "", toMenu);
   }
